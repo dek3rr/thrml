@@ -3,8 +3,13 @@ Parallel tempering utilities built on THRML's block Gibbs samplers.
 
 This module orchestrates multiple tempered chains (one per beta/model), runs
 blocked Gibbs steps on each, and proposes swaps between adjacent temperatures.
-It does not alter core sampling code; it simply composes existing
-`BlockSamplingProgram`s.
+
+Key design: all chains share the same *structural* program data (block spec,
+active flags, gather/scatter indices, samplers). Only `per_block_interactions`
+differs across chains, because it carries the beta-scaled weights. We exploit
+this by vmapping a single-chain runner over (key, state, per_block_interactions),
+replacing the Python for-loop over chains that previously unrolled n_chains
+copies of the full Gibbs graph into the XLA computation.
 """
 
 from typing import Sequence
@@ -19,31 +24,7 @@ from thrml.models.ebm import AbstractEBM
 
 def _init_sampler_states(program: BlockSamplingProgram) -> list:
     """Initialize sampler state list for a BlockSamplingProgram."""
-    # Plain list comprehension: clearer than jax.tree.map with a custom
-    # is_leaf predicate, and avoids treating a Python list as a JAX pytree.
     return [s.init() for s in program.samplers]
-
-
-def _gibbs_steps(
-    key,
-    program: BlockSamplingProgram,
-    state_free: list,
-    state_clamp: list,
-    sampler_state: list,
-    n_iters: int,
-) -> tuple[list, list]:
-    """Run n_iters block-Gibbs sweeps for a single chain.
-
-    Uses `_run_blocks` (which internally applies `jax.lax.scan`) rather than
-    a Python for loop over split keys. The Python loop was being unrolled at
-    trace time inside the outer `lax.scan` in `parallel_tempering`, producing
-    `n_chains * gibbs_steps_per_round` copies of the full Gibbs graph in the
-    XLA computation. Using `_run_blocks` keeps the trace size constant.
-    """
-    if n_iters == 0:
-        return state_free, sampler_state
-    state_free, sampler_state, _ = _run_blocks(key, program, state_free, state_clamp, n_iters, sampler_state)
-    return state_free, sampler_state
 
 
 def _attempt_swap_pair(
@@ -63,7 +44,6 @@ def _attempt_swap_pair(
     log r = (E_i(x_i) + E_j(x_j)) - (E_i(x_j) + E_j(x_i))
     """
     # Pass the pre-built BlockSpec directly so energy() skips rebuilding it.
-    # gibbs_spec IS a BlockSpec (it subclasses it), so this hits the fast path.
     spec_i = program_i.gibbs_spec
     spec_j = program_j.gibbs_spec
 
@@ -87,43 +67,69 @@ def _attempt_swap_pair(
     return lax.cond(u < accept_prob, do_swap, no_swap, (state_i, state_j))
 
 
-def _swap_pass(
+def _swap_pass_stacked(
     key,
     ebms: Sequence[AbstractEBM],
     programs: Sequence[BlockSamplingProgram],
-    states: list[list],
-    sampler_states: list[list],
+    stacked_states: list,
+    stacked_ss: list,
+    all_ss_none: bool,
     clamp_state: list,
     pair_indices: Sequence[int],
+    n_free_blocks: int,
 ):
-    """Perform one swap pass over a fixed set of adjacent pairs."""
+    """Perform one swap pass over a fixed set of adjacent pairs.
+
+    Operates on the chain-stacked state representation:
+    - ``stacked_states[b]`` has shape ``(n_chains, n_nodes_b, *node_shape)``.
+    - ``stacked_ss[b]`` has shape ``(n_chains, ...)`` or is ``None``.
+
+    For each pair (i, j) in ``pair_indices``, single-chain states are extracted
+    via static int indexing, passed to ``_attempt_swap_pair`` unchanged, then
+    scattered back with ``.at[i/j].set()``.
+    """
     n_pairs = len(ebms) - 1
+    zeros = jnp.zeros(n_pairs, dtype=jnp.int32)
 
     if len(pair_indices) == 0:
-        # Return zero JAX arrays so the caller can always do `accepted + acc_counts`
-        # without a mixed Python-int / JAX-scalar conversion.
-        return states, sampler_states, jnp.zeros(n_pairs, dtype=jnp.int32), jnp.zeros(n_pairs, dtype=jnp.int32)
+        return stacked_states, stacked_ss, zeros, zeros
 
     keys = jax.random.split(key, len(pair_indices))
-    new_states = list(states)
-    new_sampler_states = list(sampler_states)
-
-    # Use JAX arrays throughout so accumulation in one_round is a plain array add.
-    accept_counts = jnp.zeros(n_pairs, dtype=jnp.int32)
-    attempt_counts = jnp.zeros(n_pairs, dtype=jnp.int32)
+    accept_counts = zeros
+    attempt_counts = zeros
 
     for idx, pair in enumerate(pair_indices):
         i, j = pair, pair + 1
-        attempt_counts = attempt_counts.at[pair].set(1)
-        new_i, new_j, accepted = _attempt_swap_pair(
-            keys[idx], ebms[i], ebms[j], programs[i], programs[j], new_states[i], new_states[j], clamp_state
-        )
-        new_states[i], new_states[j] = new_i, new_j
-        # Sampler states follow the chain, not the state index.
-        new_sampler_states[i], new_sampler_states[j] = new_sampler_states[j], new_sampler_states[i]
-        accept_counts = accept_counts.at[pair].set(accepted)
 
-    return new_states, new_sampler_states, accept_counts, attempt_counts
+        # Extract single-chain states for the energy computation.
+        # Static int indexing into a stacked array — compiles to a gather slice.
+        state_i = [stacked_states[b][i] for b in range(n_free_blocks)]
+        state_j = [stacked_states[b][j] for b in range(n_free_blocks)]
+
+        new_i, new_j, acc = _attempt_swap_pair(
+            keys[idx], ebms[i], ebms[j], programs[i], programs[j],
+            state_i, state_j, clamp_state,
+        )
+
+        # Scatter updated states back into the stacked arrays.
+        # Both .at[i] and .at[j] use static Python ints, so XLA lowers these
+        # to a pair of scatter ops rather than a general dynamic scatter.
+        stacked_states = [
+            stacked_states[b].at[i].set(new_i[b]).at[j].set(new_j[b])
+            for b in range(n_free_blocks)
+        ]
+
+        if not all_ss_none:
+            # Swap sampler-state rows in the same way.
+            stacked_ss = [
+                stacked_ss[b].at[i].set(stacked_ss[b][j]).at[j].set(stacked_ss[b][i])
+                for b in range(n_free_blocks)
+            ]
+
+        attempt_counts = attempt_counts.at[pair].set(1)
+        accept_counts = accept_counts.at[pair].set(acc)
+
+    return stacked_states, stacked_ss, accept_counts, attempt_counts
 
 
 def parallel_tempering(
@@ -138,9 +144,33 @@ def parallel_tempering(
 ):
     """Run parallel tempering across a sequence of tempered chains.
 
-    Each round performs block Gibbs updates in every chain, then proposes
-    swaps between adjacent temperatures. All chains share the same
-    block structure and clamped state layout.
+    Each round performs block Gibbs updates in every chain in parallel via
+    ``jax.vmap``, then proposes swaps between adjacent temperatures using
+    alternating even/odd pair selection.
+
+    All chains must share the same block structure (free + clamped) and clamped
+    state. Only the EBM weights (encoded in ``per_block_interactions``) may
+    differ across chains. This is the standard parallel tempering setup where
+    chains differ only by their inverse temperature beta.
+
+    **Arguments:**
+
+    - `key`: JAX PRNG key.
+    - `ebms`: One EBM per temperature, ordered from lowest to highest beta.
+    - `programs`: One ``BlockSamplingProgram`` per temperature. All must share
+        the same block structure; only ``per_block_interactions`` may differ.
+    - `init_states`: Initial free-block states, one list per chain.
+    - `clamp_state`: Clamped-block state, shared across all chains.
+    - `n_rounds`: Number of Gibbs + swap rounds to run.
+    - `gibbs_steps_per_round`: Gibbs sweeps per chain per round.
+    - `sampler_states`: Optional initial sampler states; inferred from programs
+        if not provided.
+
+    **Returns:**
+
+    Tuple ``(states, sampler_states, stats)`` where ``stats`` is a dict with
+    keys ``accepted``, ``attempted``, and ``acceptance_rate``, each an array
+    of length ``n_chains - 1`` indexed by adjacent pair.
     """
     if not (len(ebms) == len(programs) == len(init_states)):
         raise ValueError("ebms, programs, and init_states must have the same length.")
@@ -151,10 +181,14 @@ def parallel_tempering(
     base_free = len(base_spec.free_blocks)
     base_clamped = len(base_spec.clamped_blocks)
     for prog in programs[1:]:
-        if len(prog.gibbs_spec.free_blocks) != base_free or len(prog.gibbs_spec.clamped_blocks) != base_clamped:
+        if (len(prog.gibbs_spec.free_blocks) != base_free
+                or len(prog.gibbs_spec.clamped_blocks) != base_clamped):
             raise ValueError("All programs must share the same block structure (free + clamped blocks).")
 
     clamp_state = clamp_state or []
+    n_chains = len(ebms)
+    n_free_blocks = base_free
+
     states = [list(s) for s in init_states]
     sampler_states = (
         [list(s) for s in sampler_states]
@@ -162,80 +196,178 @@ def parallel_tempering(
         else [_init_sampler_states(p) for p in programs]
     )
 
-    n_pairs = max(len(ebms) - 1, 0)
-    accepted = jnp.zeros((n_pairs,), dtype=jnp.int32)
-    attempted = jnp.zeros((n_pairs,), dtype=jnp.int32)
+    # Detect whether all sampler states are None (covers all built-in samplers:
+    # BernoulliConditional, SoftmaxConditional, SpinGibbsConditional).
+    # We handle this at Python level so we can exclude None from vmap arguments
+    # — jax.vmap cannot batch over None (it has no array axis to strip).
+    # If your sampler has real state, add it to the stacked vmap inputs below.
+    all_ss_none = all(
+        ss is None
+        for chain_ss in sampler_states
+        for ss in chain_ss
+    )
 
-    # Precompute adjacent pair indices for even and odd rounds.
+    # -------------------------------------------------------------------------
+    # Convert to chain-stacked representation
+    # -------------------------------------------------------------------------
+    # stacked_states[b]: shape (n_chains, n_nodes_b, *node_shape)
+    # All blocks for the same node type are concatenated along axis 0 inside
+    # the global state; the stacked format adds a leading chain axis on top of
+    # the per-block arrays.
+    stacked_states = [
+        jnp.stack([states[c][b] for c in range(n_chains)], axis=0)
+        for b in range(n_free_blocks)
+    ]
+
+    # stacked_ss[b]: shape (n_chains, ...) or None
+    if all_ss_none:
+        stacked_ss = [None] * n_free_blocks
+    else:
+        stacked_ss = [
+            jax.tree.map(
+                lambda *xs: jnp.stack(xs, axis=0),
+                *[sampler_states[c][b] for c in range(n_chains)],
+            )
+            for b in range(n_free_blocks)
+        ]
+
+    # stacked_pbi[b][g]: same PyTree as programs[0].per_block_interactions[b][g]
+    # but with a leading chain axis on every array leaf.
+    # Under jax.vmap the chain axis is stripped, so each vmapped call sees
+    # exactly the single-chain interaction weights it expects.
+    stacked_pbi = [
+        [
+            jax.tree.map(
+                lambda *xs: jnp.stack(xs, axis=0),
+                *[programs[c].per_block_interactions[b][g] for c in range(n_chains)],
+            )
+            for g in range(len(programs[0].per_block_interactions[b]))
+        ]
+        for b in range(n_free_blocks)
+    ]
+
+    n_pairs = max(n_chains - 1, 0)
+    accepted = jnp.zeros(n_pairs, dtype=jnp.int32)
+    attempted = jnp.zeros(n_pairs, dtype=jnp.int32)
+
     even_pair_indices = list(range(0, n_pairs, 2))
     odd_pair_indices = list(range(1, n_pairs, 2))
 
+    # -------------------------------------------------------------------------
+    # Build vmapped Gibbs runner
+    # -------------------------------------------------------------------------
+    # We close over:
+    #   programs[0]       — template for all static structural data
+    #   clamp_state       — identical across chains
+    #   gibbs_steps_per_round — scalar
+    #   stacked_pbi       — constant JAX arrays (captured in the closure)
+    #
+    # We vmap over:
+    #   gibbs_key         — one key per chain
+    #   state_free        — one block list per chain (stacked_states)
+    #   pbi               — one interaction weight set per chain (stacked_pbi)
+    #
+    # Sampler states are None for all built-in samplers, so we close over
+    # [None] * n_free_blocks rather than passing them as vmapped arguments.
+    # If you add a stateful sampler, stack its states and add them here.
+    if all_ss_none:
+        null_ss = [None] * n_free_blocks
+
+        def _run_one_chain(gibbs_key, state_free, pbi):
+            """Run one chain for gibbs_steps_per_round steps."""
+            new_state, _, _ = _run_blocks(
+                gibbs_key, programs[0], state_free, clamp_state,
+                gibbs_steps_per_round, null_ss,
+                per_block_interactions=pbi,
+            )
+            return new_state
+
+        _run_all_chains = jax.vmap(_run_one_chain)
+
+    else:
+        def _run_one_chain_with_ss(gibbs_key, state_free, pbi, ss):
+            """Run one chain with real sampler state."""
+            new_state, new_ss, _ = _run_blocks(
+                gibbs_key, programs[0], state_free, clamp_state,
+                gibbs_steps_per_round, ss,
+                per_block_interactions=pbi,
+            )
+            return new_state, new_ss
+
+        _run_all_chains = jax.vmap(_run_one_chain_with_ss)
+
+    # -------------------------------------------------------------------------
+    # Scan over rounds
+    # -------------------------------------------------------------------------
     def one_round(carry, round_idx):
-        key, states, sampler_states, accepted, attempted = carry
+        key, stacked_states, stacked_ss, accepted, attempted = carry
 
+        # One key per chain for Gibbs, one for swaps.
         key, key_round = jax.random.split(key)
-        keys = jax.random.split(key_round, len(ebms) + 1)
-        swap_key = keys[-1]
+        gibbs_keys = jax.random.split(key_round, n_chains)
+        key, swap_key = jax.random.split(key)
 
-        # Gibbs updates per chain. _gibbs_steps now uses _run_blocks internally,
-        # so each chain's steps compile to a single lax.scan rather than being
-        # unrolled into gibbs_steps_per_round separate XLA ops.
-        for i in range(len(ebms)):
-            states[i], sampler_states[i] = _gibbs_steps(
-                keys[i],
-                programs[i],
-                states[i],
-                clamp_state,
-                sampler_states[i],
-                gibbs_steps_per_round,
+        # --- Gibbs updates: all chains simultaneously via vmap ---
+        # stacked_pbi is a constant captured in the closure above; it does not
+        # change across rounds, so it is not part of the carry.
+        if all_ss_none:
+            stacked_states = _run_all_chains(gibbs_keys, stacked_states, stacked_pbi)
+        else:
+            stacked_states, stacked_ss = _run_all_chains(
+                gibbs_keys, stacked_states, stacked_pbi, stacked_ss
             )
 
+        # --- Swap step: alternating even/odd pairs via lax.cond ---
+        # Both branches (do_even, do_odd) are traced at compile time to establish
+        # output shapes; lax.cond selects between them at runtime based on parity.
+        # The Python for-loops inside _swap_pass_stacked execute at trace time,
+        # producing a fixed XLA scatter pattern for each parity.
         def do_even(args):
-            states, sampler_states, accepted, attempted, swap_key = args
-            states, sampler_states, acc_counts, att_counts = _swap_pass(
-                swap_key,
-                ebms,
-                programs,
-                states,
-                sampler_states,
-                clamp_state,
-                even_pair_indices,
+            s_states, s_ss, acc, att, s_key = args
+            s_states, s_ss, acc_counts, att_counts = _swap_pass_stacked(
+                s_key, ebms, programs, s_states, s_ss,
+                all_ss_none, clamp_state, even_pair_indices, n_free_blocks,
             )
-            # acc_counts and att_counts are already JAX int32 arrays from _swap_pass.
-            accepted = accepted + acc_counts
-            attempted = attempted + att_counts
-            return states, sampler_states, accepted, attempted
+            return s_states, s_ss, acc + acc_counts, att + att_counts
 
         def do_odd(args):
-            states, sampler_states, accepted, attempted, swap_key = args
-            states, sampler_states, acc_counts, att_counts = _swap_pass(
-                swap_key,
-                ebms,
-                programs,
-                states,
-                sampler_states,
-                clamp_state,
-                odd_pair_indices,
+            s_states, s_ss, acc, att, s_key = args
+            s_states, s_ss, acc_counts, att_counts = _swap_pass_stacked(
+                s_key, ebms, programs, s_states, s_ss,
+                all_ss_none, clamp_state, odd_pair_indices, n_free_blocks,
             )
-            accepted = accepted + acc_counts
-            attempted = attempted + att_counts
-            return states, sampler_states, accepted, attempted
+            return s_states, s_ss, acc + acc_counts, att + att_counts
 
-        parity = round_idx & 1
-        states, sampler_states, accepted, attempted = lax.cond(
-            parity == 0,
+        stacked_states, stacked_ss, accepted, attempted = lax.cond(
+            (round_idx & 1) == 0,
             do_even,
             do_odd,
-            (states, sampler_states, accepted, attempted, swap_key),
+            (stacked_states, stacked_ss, accepted, attempted, swap_key),
         )
 
-        new_carry = (key, states, sampler_states, accepted, attempted)
-        return new_carry, None
+        return (key, stacked_states, stacked_ss, accepted, attempted), None
 
     if n_rounds > 0:
-        init_carry = (key, states, sampler_states, accepted, attempted)
-        final_carry, _ = lax.scan(one_round, init_carry, jnp.arange(n_rounds))
-        key, states, sampler_states, accepted, attempted = final_carry
+        init_carry = (key, stacked_states, stacked_ss, accepted, attempted)
+        (key, stacked_states, stacked_ss, accepted, attempted), _ = lax.scan(
+            one_round, init_carry, jnp.arange(n_rounds)
+        )
+
+    # -------------------------------------------------------------------------
+    # Unstack back to list[list[Array]] format: states[chain][block]
+    # -------------------------------------------------------------------------
+    states = [
+        [stacked_states[b][c] for b in range(n_free_blocks)]
+        for c in range(n_chains)
+    ]
+
+    if all_ss_none:
+        sampler_states = [[None] * n_free_blocks for _ in range(n_chains)]
+    else:
+        sampler_states = [
+            [stacked_ss[b][c] for b in range(n_free_blocks)]
+            for c in range(n_chains)
+        ]
 
     acceptance_rate = jnp.where(attempted > 0, accepted / attempted, 0.0)
     stats = {
