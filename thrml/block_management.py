@@ -211,7 +211,7 @@ def _stack(*args):
     if eqx.is_array(args[0]):
         if args[0].shape == ():
             return jnp.stack(args)
-        # concate across node dim
+        # concatenate across node dim
         return jnp.concatenate(args, axis=0)
     else:
         assert all(args[0] == arg for arg in args[1:])
@@ -240,7 +240,6 @@ def block_state_to_global(block_state: list[_State], spec: BlockSpec) -> list[_G
     A list whose length equals
     ``len(spec.global_sd_order)``—the stacked global state.
     """
-    # list is len(blocks), global_sd_order = len(unique pytrees) <= len(blocks)
     global_state = []
     for sd_indexes in spec.block_to_global_slice_spec:
         if not sd_indexes:
@@ -249,13 +248,54 @@ def block_state_to_global(block_state: list[_State], spec: BlockSpec) -> list[_G
 
         collected = [block_state[i] for i in sd_indexes]
 
-        # todo: should probably expand dims to be 1 to be consistent?
         if len(collected) == 1:
             global_state.append(collected[0])
         else:
             global_state.append(jax.tree.map(_stack, *collected))
 
     return global_state
+
+
+def scatter_block_to_global(
+    global_state: list[_GlobalState],
+    new_block_state: _State,
+    block: Block,
+    spec: BlockSpec,
+) -> list[_GlobalState]:
+    """
+    Scatter a single block's updated state back into the global state.
+
+    This is an incremental alternative to calling ``block_state_to_global``
+    from scratch after every block update. Instead of rebuilding the full
+    concatenated global tensor, it writes only the positions that changed
+    using ``jnp.ndarray.at[...].set(...)``, which XLA lowers to a targeted
+    scatter.
+
+    Because the clamped blocks never change, carrying global state across
+    scan iterations and calling this function after each block update avoids
+    all redundant work on the clamped portion of the global state.
+
+    **Arguments:**
+
+    - `global_state`: The current global state list (will not be mutated;
+        a new list is returned).
+    - `new_block_state`: The freshly sampled state for ``block``.
+    - `block`: The block that was just sampled.
+    - `spec`: The [`thrml.BlockSpec`][] that defines the mapping.
+
+    **Returns:**
+
+    A new global state list with the positions belonging to ``block``
+    replaced by ``new_block_state``.
+    """
+    sd_ind, positions = get_node_locations(block, spec)
+    new_global = list(global_state)  # shallow copy; only one slot changes
+    new_global[sd_ind] = jax.tree.map(
+        lambda g, s: g.at[positions].set(s),
+        global_state[sd_ind],
+        new_block_state,
+    )
+    return new_global
 
 
 def get_node_locations(nodes: Block, spec: BlockSpec) -> tuple[int, Int[Array, " nodes"]]:
@@ -276,17 +316,10 @@ def get_node_locations(nodes: Block, spec: BlockSpec) -> tuple[int, Int[Array, "
     * *positions* is a 1D array with the indices each node
       occupies inside that particular PyTree.
     """
-
-    # Make sure all nodes are of the same type
-    # if len(set([type(node) for node in nodes])) > 1:
-    #     raise ValueError("All nodes must be of the same type")
-
     node_sds = spec.node_shape_dtypes[nodes.node_type]
-
     sd_inds = spec.sd_index_map[node_sds]
     global_locs = [spec.node_global_location_map[node][1] for node in nodes]
     slices = jnp.array(global_locs)
-
     return sd_inds, slices
 
 
@@ -310,7 +343,6 @@ def from_global_state(
     A list with one element per *blocks_to_extract*—each element is a PyTree
     with exactly ``len(block)`` nodes in its leading dimension.
     """
-
     all_sd_inds = []
     all_sd_slices = []
     for block in blocks_to_extract:
@@ -394,7 +426,7 @@ def _check_pytree_compat(
             vshape, vdtype = val_leaf.shape, val_leaf.dtype
             sshape, sdtype = spec_leaf.shape, spec_leaf.dtype
 
-            val_shape_without_batch = () if not len(sshape) else vshape[-(len(sshape)) :]
+            val_shape_without_batch = () if not len(sshape) else vshape[-(len(sshape)):]
 
             if val_shape_without_batch != sshape:
                 raise RuntimeError("Shape of data mismatched with spec")

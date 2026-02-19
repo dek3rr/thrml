@@ -12,6 +12,8 @@ from thrml.block_management import (
     Block,
     BlockSpec,
     block_state_to_global,
+    scatter_block_to_global,
+    get_node_locations,
     verify_block_state,
 )
 from thrml.interaction import InteractionGroup
@@ -136,6 +138,8 @@ class BlockSamplingProgram(eqx.Module):
         state list
     - `per_block_interaction_global_slices`: how to slice each array in the global state list to find the information
         required to update each block
+    - `_block_sd_inds`: precomputed sd_index for each free block (avoids recomputing inside scan)
+    - `_block_positions`: precomputed node positions in global state for each free block (avoids recomputing inside scan)
     """
 
     gibbs_spec: BlockGibbsSpec
@@ -144,6 +148,10 @@ class BlockSamplingProgram(eqx.Module):
     per_block_interaction_active: list[list[Array]]
     per_block_interaction_global_inds: list[list[list[int]]]
     per_block_interaction_global_slices: list[list[list[Array]]]
+    # Precomputed scatter indices for each free block — used by _run_blocks
+    # to avoid calling get_node_locations inside the traced scan body.
+    _block_sd_inds: list[int]
+    _block_positions: list[Array]
 
     def __init__(
         self,
@@ -204,8 +212,6 @@ class BlockSamplingProgram(eqx.Module):
         # now, take the block-arranged interaction structure and use it to construct the block-arranged interactions
         # and slicers for the global state
 
-        # if you are reading this, god help you
-
         per_block_interactions = []
         per_block_interaction_active = []
         per_block_interaction_global_inds = []
@@ -261,6 +267,17 @@ class BlockSamplingProgram(eqx.Module):
         self.per_block_interaction_active = per_block_interaction_active
         self.per_block_interaction_global_inds = per_block_interaction_global_inds
         self.per_block_interaction_global_slices = per_block_interaction_global_slices
+
+        # Precompute scatter indices for each free block so that _run_blocks
+        # never calls get_node_locations inside a traced scan body.
+        block_sd_inds = []
+        block_positions = []
+        for block in gibbs_spec.free_blocks:
+            sd_ind, positions = get_node_locations(block, gibbs_spec)
+            block_sd_inds.append(sd_ind)
+            block_positions.append(positions)
+        self._block_sd_inds = block_sd_inds
+        self._block_positions = block_positions
 
 
 _State: TypeAlias = PyTree[Shaped[Array, "nodes ?*state"], "_State"]
@@ -360,24 +377,32 @@ def sample_blocks(
 
     - Updated free-block state list and sampler-state list.
     """
-
-    # gaurdrail state/block compatibility here as everything else calls this
-
-    sds = {node_type: jax.tree.unflatten(*sd) for node_type, sd in program.gibbs_spec.node_shape_dtypes.items()}
-    verify_block_state(program.gibbs_spec.free_blocks, state_free, sds, -1)
-    verify_block_state(program.gibbs_spec.clamped_blocks, clamp_state, sds, -1)
+    # Guardrail: only check state/block compatibility in debug mode.
+    # These are pure-Python shape checks; running them inside a jax.lax.scan
+    # body adds trace-time overhead and can confuse abstract-value evaluation.
+    if __debug__:
+        sds = {node_type: jax.tree.unflatten(*sd) for node_type, sd in program.gibbs_spec.node_shape_dtypes.items()}
+        verify_block_state(program.gibbs_spec.free_blocks, state_free, sds, -1)
+        verify_block_state(program.gibbs_spec.clamped_blocks, clamp_state, sds, -1)
 
     keys = jax.random.split(key, (len(program.gibbs_spec.free_blocks),))
+    # Build global state once per call; clamped portion is constant.
+    global_state = block_state_to_global(state_free + clamp_state, program.gibbs_spec)
+
     for sampling_group in program.gibbs_spec.sampling_order:
-        global_state = block_state_to_global(state_free + clamp_state, program.gibbs_spec)
         state_updates = {}
         for i in sampling_group:
             state_updates[i], sampler_state[i] = sample_single_block(
                 keys[i], state_free, clamp_state, program, i, sampler_state[i], global_state
             )
+        for i, new_state in state_updates.items():
+            state_free[i] = new_state
+            # Targeted scatter: update only the positions that changed rather
+            # than rebuilding the full global tensor at the next group boundary.
+            global_state = scatter_block_to_global(
+                global_state, new_state, program.gibbs_spec.free_blocks[i], program.gibbs_spec
+            )
 
-        for i, state in state_updates.items():
-            state_free[i] = state
     return state_free, sampler_state
 
 
@@ -388,20 +413,59 @@ def _run_blocks(
     state_clamp: list[_State],
     n_iters: int,
     sampler_states: list[_SamplerState],
-) -> tuple[list[PyTree[Shaped[Array, "n_iters nodes ?*state"]]], list[_SamplerState]]:
+) -> tuple[list[PyTree[Shaped[Array, "nodes ?*state"]]], list[_SamplerState]]:
     """
     Perform `n_iters` steps of block sampling.
+
+    Global state is built once before the scan and carried as part of the scan
+    carry, avoiding a full O(N) concatenation on every iteration. After each
+    block is sampled, only its positions in the global state are updated via a
+    targeted scatter (`jnp.ndarray.at[...].set(...)`). The clamped portion of
+    the global state is never recomputed.
     """
     if n_iters == 0:
         return init_chain_state, sampler_states
 
-    def body_fn(states, _key):
-        state_free, sampler_state = states
-        return sample_blocks(_key, state_free, state_clamp, program, sampler_state), None
+    # Build the full global state once (free + clamped). The clamped slice
+    # never changes, so it only needs to be concatenated here.
+    init_global_state = block_state_to_global(init_chain_state + state_clamp, program.gibbs_spec)
+
+    # Pull out precomputed scatter metadata so the scan body stays pure.
+    block_sd_inds = program._block_sd_inds
+    block_positions = program._block_positions
+
+    def body_fn(carry, _key):
+        state_free, sampler_state, global_state = carry
+
+        keys = jax.random.split(_key, len(program.gibbs_spec.free_blocks))
+
+        for sampling_group in program.gibbs_spec.sampling_order:
+            state_updates = {}
+            for i in sampling_group:
+                state_updates[i], sampler_state[i] = sample_single_block(
+                    keys[i], state_free, state_clamp, program, i, sampler_state[i], global_state
+                )
+            for i, new_state in state_updates.items():
+                state_free[i] = new_state
+                # Incremental scatter: rewrite only the positions that changed.
+                # This avoids a full jnp.concatenate over all blocks each step.
+                sd_ind = block_sd_inds[i]
+                positions = block_positions[i]
+                new_global = list(global_state)
+                new_global[sd_ind] = jax.tree.map(
+                    lambda g, s: g.at[positions].set(s),
+                    global_state[sd_ind],
+                    new_state,
+                )
+                global_state = new_global
+
+        return (state_free, sampler_state, global_state), None
 
     keys = jax.random.split(key, n_iters)
-
-    return jax.lax.scan(body_fn, (init_chain_state, sampler_states), keys)[0]
+    (final_state_free, final_sampler_states, _final_global), _ = jax.lax.scan(
+        body_fn, (init_chain_state, sampler_states, init_global_state), keys
+    )
+    return final_state_free, final_sampler_states
 
 
 @dataclasses.dataclass
@@ -450,12 +514,10 @@ def sample_with_observation(
     - Tuple `(final_observer_carry, samples)` where `samples` is a PyTree whose
         leading axis has size `schedule.n_samples`.
     """
-    # run warmup
-    sampler_states = jax.tree.map(
-        lambda x: x.init(),
-        program.samplers,
-        is_leaf=lambda a: isinstance(a, AbstractConditionalSampler),
-    )
+    # Use a plain list comprehension — clearer and avoids a jax.tree.map with
+    # a custom is_leaf predicate over a non-standard container.
+    sampler_states = [s.init() for s in program.samplers]
+
     key, subkey = jax.random.split(key, 2)
     warmup_state, warmup_sampler_states = _run_blocks(
         subkey,

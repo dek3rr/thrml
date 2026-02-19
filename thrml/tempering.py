@@ -13,18 +13,15 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from thrml.block_sampling import BlockSamplingProgram, sample_blocks
-from thrml.conditional_samplers import AbstractConditionalSampler
+from thrml.block_sampling import BlockSamplingProgram, _run_blocks
 from thrml.models.ebm import AbstractEBM
 
 
-def _init_sampler_states(program: BlockSamplingProgram):
+def _init_sampler_states(program: BlockSamplingProgram) -> list:
     """Initialize sampler state list for a BlockSamplingProgram."""
-    return jax.tree.map(
-        lambda x: x.init(),
-        program.samplers,
-        is_leaf=lambda a: isinstance(a, AbstractConditionalSampler),
-    )
+    # Plain list comprehension: clearer than jax.tree.map with a custom
+    # is_leaf predicate, and avoids treating a Python list as a JAX pytree.
+    return [s.init() for s in program.samplers]
 
 
 def _gibbs_steps(
@@ -35,14 +32,17 @@ def _gibbs_steps(
     sampler_state: list,
     n_iters: int,
 ) -> tuple[list, list]:
-    """Run n_iters block-Gibbs sweeps for a single chain."""
+    """Run n_iters block-Gibbs sweeps for a single chain.
+
+    Uses `_run_blocks` (which internally applies `jax.lax.scan`) rather than
+    a Python for loop over split keys. The Python loop was being unrolled at
+    trace time inside the outer `lax.scan` in `parallel_tempering`, producing
+    `n_chains * gibbs_steps_per_round` copies of the full Gibbs graph in the
+    XLA computation. Using `_run_blocks` keeps the trace size constant.
+    """
     if n_iters == 0:
         return state_free, sampler_state
-
-    keys = jax.random.split(key, n_iters)
-    for k in keys:
-        state_free, sampler_state = sample_blocks(k, state_free, state_clamp, program, sampler_state)
-    return state_free, sampler_state
+    return _run_blocks(key, program, state_free, state_clamp, n_iters, sampler_state)
 
 
 def _attempt_swap_pair(
@@ -75,12 +75,10 @@ def _attempt_swap_pair(
 
     def do_swap(states):
         s_i, s_j = states
-        # swap and mark accepted
         return s_j, s_i, jnp.int32(1)
 
     def no_swap(states):
         s_i, s_j = states
-        # keep as-is and mark rejected
         return s_i, s_j, jnp.int32(0)
 
     return lax.cond(u < accept_prob, do_swap, no_swap, (state_i, state_j))
@@ -113,9 +111,8 @@ def _swap_pass(
         new_i, new_j, accepted = _attempt_swap_pair(
             keys[idx], ebms[i], ebms[j], programs[i], programs[j], new_states[i], new_states[j], clamp_state
         )
-        # states already come swapped or not from _attempt_swap_pair
         new_states[i], new_states[j] = new_i, new_j
-        # sampler states follow the same swap pattern
+        # Sampler states follow the chain, not the state index.
         new_sampler_states[i], new_sampler_states[j] = new_sampler_states[j], new_sampler_states[i]
         accept_counts[pair] = accepted
 
@@ -153,7 +150,9 @@ def parallel_tempering(
     clamp_state = clamp_state or []
     states = [list(s) for s in init_states]
     sampler_states = (
-        [list(s) for s in sampler_states] if sampler_states is not None else [_init_sampler_states(p) for p in programs]
+        [list(s) for s in sampler_states]
+        if sampler_states is not None
+        else [_init_sampler_states(p) for p in programs]
     )
 
     n_pairs = max(len(ebms) - 1, 0)
@@ -167,12 +166,13 @@ def parallel_tempering(
     def one_round(carry, round_idx):
         key, states, sampler_states, accepted, attempted = carry
 
-        # Keys for this round
         key, key_round = jax.random.split(key)
         keys = jax.random.split(key_round, len(ebms) + 1)
         swap_key = keys[-1]
 
-        # Gibbs updates per chain (number of chains is static)
+        # Gibbs updates per chain. _gibbs_steps now uses _run_blocks internally,
+        # so each chain's steps compile to a single lax.scan rather than being
+        # unrolled into gibbs_steps_per_round separate XLA ops.
         for i in range(len(ebms)):
             states[i], sampler_states[i] = _gibbs_steps(
                 keys[i],
