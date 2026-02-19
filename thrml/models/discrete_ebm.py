@@ -331,7 +331,7 @@ class SpinGibbsConditional(BernoulliConditional):
         where the sum over $i$ is over all the `DiscreteEBMInteractions` seen by this function.
         """
 
-        gamma = jnp.zeros(output_sd.shape)
+        gamma = jnp.zeros(output_sd.shape, dtype=jnp.float32)
         for i, (interaction, active, state) in enumerate(zip(interactions, active_flags, states)):
             if isinstance(interaction, DiscreteEBMInteraction):
                 state_bin, state_cat = _split_states(state, interaction.n_spin)
@@ -339,9 +339,6 @@ class SpinGibbsConditional(BernoulliConditional):
                 weights = _batch_gather(interaction.weights, *state_cat)
                 spin_prod = _spin_product(state_bin).astype(weights.dtype)
                 active = active.astype(weights.dtype)
-                if i == 0:
-                    gamma = gamma.astype(weights.dtype)
-
                 gamma += jnp.sum(weights * active * spin_prod, axis=-1)
             else:
                 raise RuntimeError("Unsupported interaction found")
@@ -377,16 +374,13 @@ class CategoricalGibbsConditional(SoftmaxConditional):
         where the sum over $i$ is over all the `DiscreteEBMInteractions` seen by this function.
         """
 
-        theta = jnp.zeros((*output_sd.shape, self.n_categories))
+        theta = jnp.zeros((*output_sd.shape, self.n_categories), dtype=jnp.float32)
         for i, (interaction, active, state) in enumerate(zip(interactions, active_flags, states)):
             if isinstance(interaction, DiscreteEBMInteraction):
                 state_bin, state_cat = _split_states(state, interaction.n_spin)
 
                 weights = _batch_gather_with_k(interaction.weights, *state_cat)
                 spin_prod = jnp.expand_dims(_spin_product(state_bin), -1).astype(weights.dtype)
-                if i == 0:
-                    theta = theta.astype(weights.dtype)
-
                 theta += jnp.sum(spin_prod * weights * jnp.expand_dims(active, -1).astype(weights.dtype), axis=-2)
 
             else:
