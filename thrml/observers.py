@@ -1,6 +1,6 @@
 import abc
 from collections import defaultdict
-from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, TypeVar
 
 import equinox as eqx
 import jax
@@ -35,6 +35,7 @@ class AbstractObserver(eqx.Module):
         state_clamped: list[PyTree[Array]],
         carry: ObserveCarry,
         iteration: Int[Array, ""],
+        global_state: Optional[list[PyTree[Array]]] = None,
     ) -> tuple[ObserveCarry, PyTree]:
         """Make an observation.
 
@@ -46,9 +47,12 @@ class AbstractObserver(eqx.Module):
         - `program`: The sampling program that is running when this function is called.
         - `state_free`: The current state of the free nodes involved in the sampling program.
         - `state_clamped`: The state of the clamped nodes involved in the sampling program.
-        - `carry`: The "memory" available to this observer. This function should modify this PyTree to record
-            information about the sampling program.
+        - `carry`: The "memory" available to this observer.
         - `iteration`: How many iterations of block sampling have happened before this function was called.
+        - `global_state`: The precomputed global state as returned by `_run_blocks`. When provided
+            (always the case inside `sample_with_observation`), observers use it directly to avoid
+            an extra `block_state_to_global` call. When ``None`` (user code calling an observer
+            directly), observers reconstruct it internally.
 
         **Returns:**
 
@@ -83,9 +87,12 @@ class StateObserver(AbstractObserver):
         state_clamped: list["_State"],
         carry: None,
         iteration: Int[Array, ""],
+        global_state: Optional[list[PyTree[Array]]] = None,
     ) -> tuple[None, PyTree]:
         """Simply returns the state of the blocks that are being logged to be recorded by the sampler."""
-        global_state = block_state_to_global(state_free + state_clamped, program.gibbs_spec)
+        if global_state is None:
+            # Fallback when called directly from user code without a precomputed global state.
+            global_state = block_state_to_global(state_free + state_clamped, program.gibbs_spec)
         sampled_state = from_global_state(global_state, program.gibbs_spec, self.blocks_to_sample)
         return None, sampled_state
 
@@ -124,7 +131,7 @@ class MomentAccumulatorObserver(AbstractObserver):
         arrays, used to build `flat_state` in a single scatter call.
     - `_flat_scatter_sizes`: number of entries contributed by each node type, used to
         split the concatenated sampled state before scattering.
-    - `_accumulate_dtype`: dtype for the accumulator, inferred once at construction.
+    - `_accumulate_dtype`: dtype for the accumulator, fixed at construction time.
     """
 
     blocks_to_sample: list[Block]
@@ -132,37 +139,44 @@ class MomentAccumulatorObserver(AbstractObserver):
     flat_to_type_slices_list: list[Int[Array, " nodes_in_slice"]]
     flat_to_full_moment_slices: list[Int[Array, "num_groups nodes_in_moment"]]
     f_transform: Callable
-    # Precomputed at __init__ to avoid repeated work inside the scan body.
-    _flat_scatter_index: Array          # shape: (total_flat_nodes,)
-    _flat_scatter_sizes: list[int]      # len == number of node types
+    _flat_scatter_index: Array       # shape: (total_flat_nodes,)
+    _flat_scatter_sizes: list[int]   # len == number of node types
     _flat_state_size: int
     _accumulate_dtype: jnp.dtype
 
-    def __init__(self, moment_spec: Sequence[Sequence[Sequence[AbstractNode]]], f_transform: Callable = _f_identity):
+    def __init__(
+        self,
+        moment_spec: Sequence[Sequence[Sequence[AbstractNode]]],
+        f_transform: Callable = _f_identity,
+        dtype: jnp.dtype = jnp.float32,
+    ):
         r"""
         Create a MomentAccumulatorObserver.
 
         **Arguments:**
 
-        - `moment_spec`: A 3 depth sequence. The first is a sequence
-            over different moment types. A given moment type should have the same
-            number of nodes in each moment. Then for each moment type, there is a
-            sequence over moments. Each given moment is defined by a certain set
-            of nodes.
+        - `moment_spec`: A 3 depth sequence. The first is a sequence over different moment types.
+            A given moment type should have the same number of nodes in each moment. Then for each
+            moment type, there is a sequence over moments. Each given moment is defined by a certain
+            set of nodes.
 
-            For example, to get the first and second moments on a simple o-o graph,
-            it would be
+            For example, to get the first and second moments on a simple o-o graph:
 
             [
                 [(node1,), (node2,)],
                 [(node1, node2)]
             ]
-        - `f_transform`: A function that takes in (state, blocks) and returns something with the same structure as
-            state. This is used to apply functions to the samples before moments are computed. i.e this function
-            defines a transformation of the state variable $y=f(x)$, such that the accumulated moments
-            are of the form $\langle f(x_1) f(x_2) \rangle$.
+
+        - `f_transform`: A function that takes in (state, blocks) and returns something with the same
+            structure as state. Defines a transformation $y=f(x)$ so accumulated moments are
+            $\langle f(x_1) f(x_2) \rangle$.
+
+        - `dtype`: Accumulator dtype, fixed at construction. Defaults to `jnp.float32`. Use
+            `jnp.float64` for double-precision models. Fixing this here avoids a per-step cast
+            inside the scan body.
         """
         self.f_transform = f_transform
+        self._accumulate_dtype = dtype
 
         flat_nodes_list = []
         node_to_flat_idx = {}
@@ -200,17 +214,13 @@ class MomentAccumulatorObserver(AbstractObserver):
 
         # Precompute a single concatenated scatter index so __call__ can build
         # flat_state with one .at[].set() instead of one per node type.
-        # Both _flat_scatter_index and _flat_scatter_sizes are static (no JAX
-        # arrays change shape), so this is pure Python bookkeeping.
-        self._flat_scatter_index = jnp.concatenate(flat_to_type_slices_list) if flat_to_type_slices_list else jnp.array([], dtype=int)
+        self._flat_scatter_index = (
+            jnp.concatenate(flat_to_type_slices_list)
+            if flat_to_type_slices_list
+            else jnp.array([], dtype=int)
+        )
         self._flat_scatter_sizes = [len(s) for s in flat_to_type_slices_list]
         self._flat_state_size = len(flat_nodes_list)
-
-        # Infer accumulator dtype once. We use float32 as the default rather
-        # than Python `float` (float64) to stay consistent with typical JAX
-        # default dtypes. If the model uses float64, jnp.result_type will
-        # return that instead.
-        self._accumulate_dtype = jnp.float32
 
     def __call__(
         self,
@@ -219,15 +229,17 @@ class MomentAccumulatorObserver(AbstractObserver):
         state_clamped: list[PyTree[Array]],
         carry: list[Array],
         iteration: Int[Array, ""],
+        global_state: Optional[list[PyTree[Array]]] = None,
     ) -> tuple[list[Array], PyTree]:
         """Accumulate the moments via `carry`. Does not return anything for the sampler to write down."""
-        global_state = block_state_to_global(state_free + state_clamped, program.gibbs_spec)
+        if global_state is None:
+            # Fallback when called directly from user code without a precomputed global state.
+            global_state = block_state_to_global(state_free + state_clamped, program.gibbs_spec)
+
         sampled_state = from_global_state(global_state, program.gibbs_spec, self.blocks_to_sample)
         sampled_state = list(self.f_transform(sampled_state, self.blocks_to_sample))
 
-        # Build flat_state with a single scatter instead of one .at[].set() per
-        # node type. Concatenating sampled_state leaves along axis=0 is safe
-        # because all leaves are 1D (one scalar per node).
+        # Single scatter instead of one .at[].set() per node type.
         flat_values = jnp.concatenate([jnp.ravel(s) for s in sampled_state])
         flat_state = (
             jnp.zeros(self._flat_state_size, dtype=self._accumulate_dtype)
@@ -236,20 +248,19 @@ class MomentAccumulatorObserver(AbstractObserver):
         )
 
         def accumulate_moment(mem_entry, sl):
-            # sl: (num_groups, nodes_in_moment) — gather then product over nodes_in_moment
+            # sl: (num_groups, nodes_in_moment) — gather then product over nodes_in_moment.
+            # mem_entry and update share _accumulate_dtype, so no cast needed.
             update = jnp.prod(flat_state[sl], axis=1)
             return mem_entry + update
 
         mem = jax.tree.map(accumulate_moment, carry, self.flat_to_full_moment_slices)
-
         return mem, None
 
     def init(self) -> list[Array]:
-        """Initialize the memory that will store the accumulated values.
+        """Initialize the moment accumulators with the correct dtype.
 
         Uses an explicit list comprehension rather than jax.tree.map over a list
-        of arrays, which relies on the implicit list-as-pytree behaviour and
-        is harder to follow.
+        of arrays, and initialises with `_accumulate_dtype` to avoid any per-step cast.
         """
         return [
             jnp.zeros(x.shape[0], dtype=self._accumulate_dtype)
