@@ -1,3 +1,6 @@
+# Modified from the original thrml library (https://github.com/Extropic-AI/thrml)
+# Changes: global state threaded through scan carry; added per_block_interactions override to _run_blocks and sample_single_block
+
 import dataclasses
 from collections import defaultdict
 from typing import Mapping, Sequence, Type, TypeAlias

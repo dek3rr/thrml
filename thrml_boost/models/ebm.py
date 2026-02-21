@@ -1,3 +1,5 @@
+# Modified from the original thrml library (https://github.com/Extropic-AI/thrml)
+# Changes: added BlockSpec fast path in energy() to skip redundant spec reconstruction
 import abc
 
 import equinox as eqx

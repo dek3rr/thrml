@@ -1,3 +1,6 @@
+# Modified from the original thrml library (https://github.com/Extropic-AI/thrml)
+# Changes: rewrote hinton_init to handle ragged block sizes correctly
+
 import equinox as eqx
 import jax
 from jax import numpy as jnp

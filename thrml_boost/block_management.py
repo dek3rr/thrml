@@ -1,3 +1,6 @@
+# Modified from the original thrml library (https://github.com/Extropic-AI/thrml)
+# Changes: replaced set comprehension with dict.fromkeys() for deterministic global_sd_order
+
 from typing import (
     Generic,
     Iterator,

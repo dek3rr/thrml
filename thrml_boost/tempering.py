@@ -1,3 +1,5 @@
+# Modified from the original thrml library PR https://github.com/extropic-ai/thrml/pull/30
+# Changes: replaced Python loop over chains with jax.vmap; fixed non-array leaf handling in stacked per_block_interactions
 """
 Parallel tempering utilities built on THRML's block Gibbs samplers.
 

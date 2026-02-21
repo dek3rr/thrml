@@ -1,3 +1,6 @@
+# Modified from the original thrml library (https://github.com/Extropic-AI/thrml)
+# Changes: added global_state fast path to avoid redundant reconstruction; added dtype parameter to MomentAccumulatorObserver
+
 import abc
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence, TypeVar
