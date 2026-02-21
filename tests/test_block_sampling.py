@@ -1,3 +1,12 @@
+"""Tests for block_sampling.py.
+
+All original tests are preserved. Added:
+- TestRunBlocksGlobalState: _run_blocks returns a 3-tuple; the third element
+  (global_state) is consistent with block_state_to_global on the final state.
+- TestPerBlockInteractionsOverride: passing per_block_interactions to
+  _run_blocks / sample_single_block changes the output in the expected way.
+"""
+
 import unittest
 
 import equinox as eqx
@@ -6,11 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Key, PyTree
 
-from thrml.block_management import Block
+from thrml.block_management import Block, block_state_to_global
 from thrml.block_sampling import (
     BlockGibbsSpec,
     BlockSamplingProgram,
     SamplingSchedule,
+    _run_blocks,
     sample_blocks,
     sample_single_block,
     sample_states,
@@ -60,7 +70,6 @@ class PlusMinusSampler(AbstractConditionalSampler):
                 output -= jnp.sum(interaction.multiplier * active * s, axis=-1)
             else:
                 raise RuntimeError("Invalid interaction passed to PlusMinusSampler")
-
         return output, sampler_state
 
     def init(self) -> _SamplerState:
@@ -74,7 +83,6 @@ class TestPlusMinus(unittest.TestCase):
         key = jax.random.key(424)
 
         free_nodes = [ContinousScalarNode() for _ in range(3)]
-
         minus_nodes = [ContinousScalarNode() for _ in range(2)]
         plus_nodes = [ContinousScalarNode() for _ in range(2)]
 
@@ -88,13 +96,11 @@ class TestPlusMinus(unittest.TestCase):
             Block([free_nodes[0], free_nodes[0], free_nodes[1]]),
             [Block([minus_nodes[0], minus_nodes[1], minus_nodes[1]])],
         )
-
         plus_interaction_group = InteractionGroup(
             PlusInteraction(self.plus_weights),
             Block([free_nodes[1], free_nodes[2], free_nodes[2]]),
             [Block([plus_nodes[0], plus_nodes[0], plus_nodes[1]])],
         )
-
         memory_interaction_group = InteractionGroup(
             MemoryInteraction(jnp.ones(len(free_nodes))), Block(free_nodes), [Block(free_nodes)]
         )
@@ -118,7 +124,6 @@ class TestPlusMinus(unittest.TestCase):
             jax.random.uniform(keys[1], (2,), minval=1.0, maxval=5.0),
         ]
         self.state_clamped = [jax.random.uniform(keys[2], (4,), minval=1.0, maxval=5.0)]
-
         self.key = keys[-1]
 
     def test_sample_block(self):
@@ -140,29 +145,25 @@ class TestPlusMinus(unittest.TestCase):
         self.assertTrue(np.allclose(outputs[1], [second_output, third_output], rtol=1e-6))
 
     def test_sample_blocks(self):
-        # just make sure this runs, nothing new to learn
         sample_blocks(self.key, self.state_free, self.state_clamped, self.program, [None, None])
 
     def test_sample_states(self):
-        # just make sure this runs
         schedule = SamplingSchedule(5, 5, 5)
         sample_states(
-            self.key, self.program, schedule, self.state_free, self.state_clamped, self.program.gibbs_spec.free_blocks
+            self.key, self.program, schedule, self.state_free, self.state_clamped,
+            self.program.gibbs_spec.free_blocks,
         )
 
     def test_state_gaurdrailing(self):
         wrong_state_free = [self.state_free[0], jnp.zeros((2,), dtype=jnp.bool)]
-
         wrong_state_clamped = [jnp.zeros((4,), dtype=jnp.bool)]
 
         with self.assertRaises(RuntimeError) as error:
             _ = sample_blocks(self.key, wrong_state_free, self.state_clamped, self.program, [None, None])
-
         self.assertIn("type", str(error.exception))
 
         with self.assertRaises(RuntimeError) as error:
             _ = sample_blocks(self.key, self.state_free, wrong_state_clamped, self.program, [None, None])
-
         self.assertIn("type", str(error.exception))
 
 
@@ -197,11 +198,13 @@ class IncrementSampler(AbstractConditionalSampler):
         output_sd: PyTree[jax.ShapeDtypeStruct],
     ):
         assert isinstance(output_sd, MultiNodeState)
-
         for interaction, active, state in zip(interactions, active_flags, states):
             if isinstance(interaction, PlusInteraction):
                 return (
-                    MultiNodeState(state[0].float_counter[:, 0, :] + 1, state[0].cat_counter[:, 0, :] + 1),
+                    MultiNodeState(
+                        state[0].float_counter[:, 0, :] + 1,
+                        state[0].cat_counter[:, 0, :] + 1,
+                    ),
                     sampler_state,
                 )
 
@@ -210,24 +213,23 @@ class IncrementSampler(AbstractConditionalSampler):
 
 
 class TestPyTreeState(unittest.TestCase):
-    """Test that a sampling program involving nodes with more general pytree shapedtypes works"""
-
     def test_pytree_state(self):
         n_float = 2
         n_cat = 4
 
         sd_map = {
             MultiNode: MultiNodeState(
-                jax.ShapeDtypeStruct((n_float,), jnp.float32), jax.ShapeDtypeStruct((n_cat,), jnp.int8)
+                jax.ShapeDtypeStruct((n_float,), jnp.float32),
+                jax.ShapeDtypeStruct((n_cat,), jnp.int8),
             )
         }
 
         nodes = [MultiNode() for _ in range(10)]
-
         key = jax.random.key(424)
 
-        interaction_group = InteractionGroup(PlusInteraction(jnp.ones((len(nodes),))), Block(nodes), [Block(nodes)])
-
+        interaction_group = InteractionGroup(
+            PlusInteraction(jnp.ones((len(nodes),))), Block(nodes), [Block(nodes)]
+        )
         spec = BlockGibbsSpec([Block(nodes)], [], sd_map)
 
         key, subkey = jax.random.split(key, 2)
@@ -236,10 +238,134 @@ class TestPyTreeState(unittest.TestCase):
         init_cat = jax.random.randint(subkey, (len(nodes), n_cat), minval=-4, maxval=4)
 
         init_state = [MultiNodeState(init_float, init_cat)]
-
         prog = BlockSamplingProgram(spec, [IncrementSampler()], [interaction_group])
 
         res, _ = sample_single_block(key, init_state, [], prog, 0, None)
 
         self.assertTrue(jnp.allclose(init_state[0].cat_counter + 1, res.cat_counter))
         self.assertTrue(jnp.allclose(init_state[0].float_counter + 1, res.float_counter))
+
+
+# ---------------------------------------------------------------------------
+# New tests for _run_blocks global_state return and per_block_interactions
+# ---------------------------------------------------------------------------
+
+class TestRunBlocksGlobalState(unittest.TestCase):
+    """_run_blocks now returns a 3-tuple (state, sampler_states, global_state).
+    Verify that the returned global_state is consistent with reconstructing it
+    manually from the returned free state.
+    """
+
+    def _make_simple_program(self):
+        nodes = [ContinousScalarNode() for _ in range(4)]
+        key = jax.random.key(1)
+        weights = jax.random.normal(key, (len(nodes),))
+        interaction = InteractionGroup(
+            PlusInteraction(weights), Block(nodes), [Block(nodes)]
+        )
+        spec = BlockGibbsSpec(
+            [Block(nodes[:2]), Block(nodes[2:])],
+            [],
+            {ContinousScalarNode: jax.ShapeDtypeStruct((), jnp.float32)},
+        )
+        prog = BlockSamplingProgram(spec, [PlusMinusSampler(), PlusMinusSampler()], [interaction])
+        init_state = [jnp.ones((2,), jnp.float32), jnp.ones((2,), jnp.float32)]
+        return prog, init_state
+
+    def test_returns_three_tuple(self):
+        prog, init_state = self._make_simple_program()
+        result = _run_blocks(jax.random.key(0), prog, init_state, [], n_iters=2, sampler_states=[None, None])
+        self.assertEqual(len(result), 3, "Expected _run_blocks to return a 3-tuple")
+
+    def test_global_state_consistent_with_final_state(self):
+        """The returned global_state should match block_state_to_global applied to the final free state."""
+        prog, init_state = self._make_simple_program()
+        final_state, _, returned_global = jax.jit(_run_blocks)(
+            jax.random.key(0), prog, init_state, [], n_iters=3, sampler_states=[None, None]
+        )
+
+        expected_global = block_state_to_global(final_state, prog.gibbs_spec)
+
+        self.assertEqual(len(returned_global), len(expected_global))
+        for a, b in zip(returned_global, expected_global):
+            self.assertTrue(jnp.allclose(a, b), "Returned global_state inconsistent with final state")
+
+    def test_zero_iters_returns_init_global(self):
+        """n_iters=0 early-return path must also return a valid global_state."""
+        prog, init_state = self._make_simple_program()
+        final_state, _, returned_global = _run_blocks(
+            jax.random.key(0), prog, init_state, [], n_iters=0, sampler_states=[None, None]
+        )
+
+        expected_global = block_state_to_global(init_state, prog.gibbs_spec)
+        for a, b in zip(returned_global, expected_global):
+            self.assertTrue(jnp.allclose(a, b))
+
+
+class TestPerBlockInteractionsOverride(unittest.TestCase):
+    """Passing per_block_interactions to sample_single_block and _run_blocks
+    should override the program's own interactions, changing the output."""
+
+    def setUp(self):
+        nodes = [ContinousScalarNode() for _ in range(2)]
+        key = jax.random.key(9)
+
+        self.weights_a = jax.random.normal(key, (len(nodes),)) + 5.0   # far from zero
+        key, _ = jax.random.split(key)
+        self.weights_b = -self.weights_a                                 # opposite sign
+
+        int_a = InteractionGroup(PlusInteraction(self.weights_a), Block(nodes), [Block(nodes)])
+        int_b = InteractionGroup(PlusInteraction(self.weights_b), Block(nodes), [Block(nodes)])
+
+        spec = BlockGibbsSpec(
+            [Block(nodes)],
+            [],
+            {ContinousScalarNode: jax.ShapeDtypeStruct((), jnp.float32)},
+        )
+        self.prog_a = BlockSamplingProgram(spec, [PlusMinusSampler()], [int_a])
+        self.prog_b = BlockSamplingProgram(spec, [PlusMinusSampler()], [int_b])
+        self.init_state = [jnp.ones((len(nodes),), jnp.float32)]
+        self.key = jax.random.key(42)
+
+    def test_override_changes_sample_single_block(self):
+        """sample_single_block with per_block_interactions=prog_b's interactions
+        should give the same result as running prog_b directly."""
+        result_prog_b, _ = sample_single_block(
+            self.key, self.init_state, [], self.prog_b, block=0, sampler_state=None
+        )
+        result_override, _ = sample_single_block(
+            self.key, self.init_state, [], self.prog_a, block=0, sampler_state=None,
+            per_block_interactions=self.prog_b.per_block_interactions,
+        )
+
+        self.assertTrue(jnp.allclose(result_prog_b, result_override))
+
+    def test_override_differs_from_original(self):
+        """The overridden result should differ from running prog_a."""
+        result_prog_a, _ = sample_single_block(
+            self.key, self.init_state, [], self.prog_a, block=0, sampler_state=None
+        )
+        result_override, _ = sample_single_block(
+            self.key, self.init_state, [], self.prog_a, block=0, sampler_state=None,
+            per_block_interactions=self.prog_b.per_block_interactions,
+        )
+
+        self.assertFalse(jnp.allclose(result_prog_a, result_override),
+                         "Expected different results for opposite-sign weights")
+
+    def test_override_in_run_blocks(self):
+        """_run_blocks with per_block_interactions override gives same final
+        state as running prog_b directly (same key, same n_iters)."""
+        n_iters = 3
+        ss = [None]
+
+        state_b, _, _ = jax.jit(_run_blocks)(
+            self.key, self.prog_b, self.init_state, [], n_iters, ss
+        )
+        state_override, _, _ = jax.jit(_run_blocks)(
+            self.key, self.prog_a, self.init_state, [], n_iters, ss,
+            per_block_interactions=self.prog_b.per_block_interactions,
+        )
+
+        for a, b in zip(state_b, state_override):
+            self.assertTrue(jnp.allclose(a, b))

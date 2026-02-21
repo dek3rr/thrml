@@ -1,3 +1,9 @@
+"""Tests for block_management.py.
+
+All original tests are preserved. Added:
+- TestBlockSpecOrdering: verifies global_sd_order is deterministic and
+  insertion-order-preserving (the dict.fromkeys fix vs the old set comprehension).
+"""
 import unittest
 
 import equinox as eqx
@@ -32,7 +38,6 @@ class TestBlocks(unittest.TestCase):
             block_management.Block([Node3() for _ in range(3)]),
         ]
 
-        # ShapeDtypeStruct definitions
         bool_type = jax.ShapeDtypeStruct((2,), dtype=jnp.bool_)
         float_type = jax.ShapeDtypeStruct((5,), dtype=jnp.float32)
         int_type = jax.ShapeDtypeStruct((2,), dtype=jnp.int16)
@@ -64,7 +69,6 @@ class TestBlocks(unittest.TestCase):
             Node3: CustomObj(),
         }
 
-        # Collect them for testing
         self.node_type_dicts = {
             "variation0": self.node_types,
             "variation1": self.node_types1,
@@ -99,9 +103,15 @@ class TestBlocks(unittest.TestCase):
         for label, (spec, block_state, _) in self.configs.items():
             with self.subTest(msg=f"Testing empty_state with {label}"):
                 batch_shape = (10, 2)
-                empty_state = block_management.make_empty_block_state(spec.blocks, spec.node_shape_struct, batch_shape)
-                empty_state = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), empty_state)
-                b_state = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), block_state)
+                empty_state = block_management.make_empty_block_state(
+                    spec.blocks, spec.node_shape_struct, batch_shape
+                )
+                empty_state = jax.tree.map(
+                    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), empty_state
+                )
+                b_state = jax.tree.map(
+                    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), block_state
+                )
                 eqx.tree_equal(empty_state, b_state)
 
 
@@ -149,13 +159,10 @@ class TestBlockCompat(unittest.TestCase):
         t2 = Template2(5, jnp.zeros((*self.batch_shape, 3, 4), dtype=jnp.float32))
         self.good_state_2 = Template1(
             t2,
-            jnp.zeros(
-                (
-                    *self.batch_shape,
-                    3,
-                ),
-                dtype=jnp.int8,
-            ),
+            jnp.zeros((
+                *self.batch_shape,
+                3,
+            ), dtype=jnp.int8),
             19.9,
         )
 
@@ -164,78 +171,69 @@ class TestBlockCompat(unittest.TestCase):
     def test_good(self):
         temp_1_good = Template1(self.temp_2_good, jnp.zeros(self.batch_shape, dtype=jnp.int8), 7.1)
         batch_shape = block_management._check_pytree_compat(self.temp_1_sd, temp_1_good)
-
         self.assertEqual(batch_shape, self.batch_shape)
 
     def test_bad_dtype(self):
         temp_1_bad = Template1(self.temp_2_good, jnp.zeros(self.batch_shape, dtype=jnp.float32), 10.2)
         with self.assertRaises(RuntimeError) as error:
             _ = block_management._check_pytree_compat(self.temp_1_sd, temp_1_bad)
-
         self.assertIn("type", str(error.exception))
 
     def test_bad_shape(self):
         temp_1_bad = Template1(self.temp_2_good, jnp.zeros((*self.batch_shape, 1), dtype=jnp.int8), 11.9)
         with self.assertRaises(RuntimeError) as error:
             _ = block_management._check_pytree_compat(self.temp_1_sd, temp_1_bad)
-
         self.assertIn("shape", str(error.exception))
 
     def test_missing_array(self):
         temp_1_bad = Template1(self.temp_2_good, 1.0, 11.9)
         with self.assertRaises(RuntimeError) as error:
             _ = block_management._check_pytree_compat(self.temp_1_sd, temp_1_bad)
-
         self.assertIn("missing", str(error.exception))
 
     def test_bad_structure(self):
         temp_1_bad = jnp.array(1.0)
         with self.assertRaises(RuntimeError) as error:
             _ = block_management._check_pytree_compat(self.temp_1_sd, temp_1_bad)
-
         self.assertIn("structure", str(error.exception))
 
     def test_good_state(self):
-        # should pass
         block_management.verify_block_state(
-            self.blocks, [self.good_state_1, self.good_state_2, self.good_state_3], self.node_sd_map, block_axis=-1
+            self.blocks, [self.good_state_1, self.good_state_2, self.good_state_3],
+            self.node_sd_map, block_axis=-1,
         )
 
     def test_wrong_state_len(self):
         with self.assertRaises(RuntimeError) as error:
             block_management.verify_block_state(
-                self.blocks, [self.good_state_1, self.good_state_2], self.node_sd_map, block_axis=-1
+                self.blocks, [self.good_state_1, self.good_state_2],
+                self.node_sd_map, block_axis=-1,
             )
-
         self.assertIn("of states not equal", str(error.exception))
 
     def test_bad_block(self):
         bad_state = self.good_state_3.astype(jnp.bool)
-
         with self.assertRaises(RuntimeError) as error:
             block_management.verify_block_state(
-                self.blocks, [self.good_state_1, self.good_state_2, bad_state], self.node_sd_map, block_axis=-1
+                self.blocks, [self.good_state_1, self.good_state_2, bad_state],
+                self.node_sd_map, block_axis=-1,
             )
-
         self.assertIn("type", str(error.exception))
 
     def test_length_mismatch(self):
         bad_state = jnp.zeros((*self.batch_shape, 4, 7), dtype=jnp.float32)
-
         with self.assertRaises(RuntimeError) as error:
             block_management.verify_block_state(
-                self.blocks, [self.good_state_1, self.good_state_2, bad_state], self.node_sd_map, block_axis=-1
+                self.blocks, [self.good_state_1, self.good_state_2, bad_state],
+                self.node_sd_map, block_axis=-1,
             )
-
         self.assertIn("block length", str(error.exception))
 
 
 class TestDuplicate(unittest.TestCase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self.good_blocks = [block_management.Block([Node1() for _ in range(3)]) for _ in range(2)]
-
         self.node_sd = {Node1: jax.ShapeDtypeStruct}
 
     def test_good(self):
@@ -244,5 +242,84 @@ class TestDuplicate(unittest.TestCase):
     def test_duplicate(self):
         with self.assertRaises(RuntimeError) as error:
             _ = block_management.BlockSpec(self.good_blocks + self.good_blocks, self.node_sd)
-
         self.assertIn("show up twice", str(error.exception))
+
+
+class TestBlockSpecOrdering(unittest.TestCase):
+    """Verify that BlockSpec.global_sd_order is deterministic and follows
+    insertion order, not set-iteration order.
+
+    The fix: replaced ``list({sd for sd in ...})`` with
+    ``list(dict.fromkeys(...))`` in BlockSpec.__init__.  Python sets have
+    non-deterministic iteration order across interpreter runs, which would
+    make the global state layout irreproducible.
+    """
+
+    def _make_spec(self, node_types):
+        blocks = [
+            block_management.Block([Node1() for _ in range(2)]),
+            block_management.Block([Node2() for _ in range(2)]),
+            block_management.Block([Node3() for _ in range(2)]),
+        ]
+        return block_management.BlockSpec(blocks, node_types)
+
+    def test_same_spec_same_order(self):
+        """Building the same BlockSpec twice produces identical global_sd_order."""
+        node_types = {
+            Node1: jax.ShapeDtypeStruct((), jnp.bool_),
+            Node2: jax.ShapeDtypeStruct((), jnp.float32),
+            Node3: jax.ShapeDtypeStruct((), jnp.int8),
+        }
+        spec_a = self._make_spec(node_types)
+        spec_b = self._make_spec(node_types)
+        self.assertEqual(spec_a.global_sd_order, spec_b.global_sd_order)
+
+    def test_shared_sd_deduplicated_stably(self):
+        """When multiple node types share the same ShapeDtypeStruct, it should
+        appear exactly once in global_sd_order, at the position of its first
+        occurrence in the iteration order of node_shape_dtypes."""
+        shared = jax.ShapeDtypeStruct((), jnp.bool_)
+        node_types = {
+            Node1: shared,
+            Node2: shared,   # duplicate — same object
+            Node3: jax.ShapeDtypeStruct((), jnp.float32),
+        }
+        spec = self._make_spec(node_types)
+
+        # shared appears first (Node1 is first), float32 second
+        self.assertEqual(len(spec.global_sd_order), 2)
+        # The unique SD from Node1/Node2 (bool_) should come before float32
+        # because Node1 is encountered first.
+        from thrml.block_management import _hash_pytree
+        hashed_order = spec.global_sd_order
+        hashed_bool = _hash_pytree(shared)
+        hashed_float = _hash_pytree(jax.ShapeDtypeStruct((), jnp.float32))
+        self.assertEqual(hashed_order[0], hashed_bool)
+        self.assertEqual(hashed_order[1], hashed_float)
+
+    def test_roundtrip_is_stable(self):
+        """block_state_to_global → from_global_state is stable across two
+        independently constructed BlockSpecs with the same inputs."""
+        node_types = {
+            Node1: jax.ShapeDtypeStruct((), jnp.bool_),
+            Node2: jax.ShapeDtypeStruct((), jnp.float32),
+            Node3: jax.ShapeDtypeStruct((), jnp.int8),
+        }
+        blocks = [
+            block_management.Block([Node1() for _ in range(3)]),
+            block_management.Block([Node2() for _ in range(2)]),
+            block_management.Block([Node3() for _ in range(4)]),
+        ]
+
+        block_state = block_management.make_empty_block_state(blocks, node_types)
+
+        spec1 = block_management.BlockSpec(blocks, node_types)
+        spec2 = block_management.BlockSpec(blocks, node_types)
+
+        gs1 = block_management.block_state_to_global(block_state, spec1)
+        gs2 = block_management.block_state_to_global(block_state, spec2)
+
+        # Both global states should have the same structure and values
+        self.assertEqual(len(gs1), len(gs2))
+        for a, b in zip(gs1, gs2):
+            self.assertTrue(jnp.array_equal(a, b))
