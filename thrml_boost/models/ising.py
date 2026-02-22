@@ -165,11 +165,9 @@ def hinton_init(
     result = []
     for block, k in zip(blocks, keys):
         indices = jnp.array([node_map[n] for n in block], dtype=jnp.int32)
-        block_biases = model.biases[indices]                          # (block_size,)
+        block_biases = model.biases[indices]  # (block_size,)
         probs = jax.nn.sigmoid(model.beta * block_biases)
-        sample = jax.random.bernoulli(
-            k, p=probs, shape=(*batch_shape, len(block))
-        ).astype(jnp.bool_)
+        sample = jax.random.bernoulli(k, p=probs, shape=(*batch_shape, len(block))).astype(jnp.bool_)
         result.append(sample)
 
     return result
@@ -270,9 +268,7 @@ def estimate_kl_grad(
     """
     key_pos, key_neg = jax.random.split(key, 2)
 
-    cond_batched_pos = jax.tree.map(
-        lambda x: jnp.broadcast_to(x, (data[0].shape[0], *x.shape)), conditioning_values
-    )
+    cond_batched_pos = jax.tree.map(lambda x: jnp.broadcast_to(x, (data[0].shape[0], *x.shape)), conditioning_values)
 
     # Name the chain/batch axes explicitly to make the split shape legible.
     n_chains_pos, batch_size = init_state_positive[0].shape[:2]

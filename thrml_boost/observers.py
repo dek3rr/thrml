@@ -142,8 +142,8 @@ class MomentAccumulatorObserver(AbstractObserver):
     flat_to_type_slices_list: list[Int[Array, " nodes_in_slice"]]
     flat_to_full_moment_slices: list[Int[Array, "num_groups nodes_in_moment"]]
     f_transform: Callable
-    _flat_scatter_index: Array       # shape: (total_flat_nodes,)
-    _flat_scatter_sizes: list[int]   # len == number of node types
+    _flat_scatter_index: Array  # shape: (total_flat_nodes,)
+    _flat_scatter_sizes: list[int]  # len == number of node types
     _flat_state_size: int
     _accumulate_dtype: jnp.dtype
 
@@ -223,9 +223,7 @@ class MomentAccumulatorObserver(AbstractObserver):
         # Precompute a single concatenated scatter index so __call__ can build
         # flat_state with one .at[].set() instead of one per node type.
         self._flat_scatter_index = (
-            jnp.concatenate(flat_to_type_slices_list)
-            if flat_to_type_slices_list
-            else jnp.array([], dtype=int)
+            jnp.concatenate(flat_to_type_slices_list) if flat_to_type_slices_list else jnp.array([], dtype=int)
         )
         self._flat_scatter_sizes = [len(s) for s in flat_to_type_slices_list]
         self._flat_state_size = len(flat_nodes_list)
@@ -270,7 +268,4 @@ class MomentAccumulatorObserver(AbstractObserver):
         Uses an explicit list comprehension rather than jax.tree.map over a list
         of arrays, and initialises with `_accumulate_dtype` to avoid any per-step cast.
         """
-        return [
-            jnp.zeros(x.shape[0], dtype=self._accumulate_dtype)
-            for x in self.flat_to_full_moment_slices
-        ]
+        return [jnp.zeros(x.shape[0], dtype=self._accumulate_dtype) for x in self.flat_to_full_moment_slices]

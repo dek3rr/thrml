@@ -429,7 +429,7 @@ def _check_pytree_compat(
             vshape, vdtype = val_leaf.shape, val_leaf.dtype
             sshape, sdtype = spec_leaf.shape, spec_leaf.dtype
 
-            val_shape_without_batch = () if not len(sshape) else vshape[-(len(sshape)):]
+            val_shape_without_batch = () if not len(sshape) else vshape[-(len(sshape)) :]
 
             if val_shape_without_batch != sshape:
                 raise RuntimeError("Shape of data mismatched with spec")

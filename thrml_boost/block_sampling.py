@@ -355,9 +355,7 @@ def sample_single_block(
     # Use the override interactions if provided (vmapped multi-chain execution),
     # otherwise fall back to the program's own interactions.
     block_interactions = (
-        per_block_interactions[block]
-        if per_block_interactions is not None
-        else program.per_block_interactions[block]
+        per_block_interactions[block] if per_block_interactions is not None else program.per_block_interactions[block]
     )
 
     sampler = program.samplers[block]
@@ -430,7 +428,7 @@ def _run_blocks(
     n_iters: int,
     sampler_states: list[_SamplerState],
     per_block_interactions: list[list[PyTree]] | None = None,
-) -> tuple[list[PyTree[Shaped[Array, "nodes ?*state"]]], list[_SamplerState]]:
+) -> tuple[list[PyTree[Shaped[Array, "nodes ?*state"]]], list[_SamplerState], list[PyTree]]:
     """
     Perform `n_iters` steps of block sampling.
 
@@ -475,7 +473,13 @@ def _run_blocks(
             state_updates = {}
             for i in sampling_group:
                 state_updates[i], sampler_state[i] = sample_single_block(
-                    keys[i], state_free, state_clamp, program, i, sampler_state[i], global_state,
+                    keys[i],
+                    state_free,
+                    state_clamp,
+                    program,
+                    i,
+                    sampler_state[i],
+                    global_state,
                     per_block_interactions=pbi,
                 )
             for i, new_state in state_updates.items():
