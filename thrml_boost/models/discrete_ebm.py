@@ -85,21 +85,10 @@ class DiscreteEBMFactor(EBMFactor, WeightedFactor):
     is_spin: dict[Type[AbstractNode], bool]
 
     def __init__(self, spin_node_groups: list[Block], categorical_node_groups: list[Block], weights: Array):
-        """
-        Create a `DiscreteEBMFactor`.
-
-        **Arguments:**
-
-        - `spin_node_groups`: The spin node groups
-        - `categorical_node_groups`: The categorical node groups
-        - `weights`: The interaction weight tensor
-        """
-
         WeightedFactor.__init__(self, weights, spin_node_groups + categorical_node_groups)
 
         is_spin = defaultdict(lambda: False)
 
-        # remember which node types are spin
         for group in spin_node_groups:
             is_spin[type(group.nodes[0])] = True
 
@@ -109,8 +98,6 @@ class DiscreteEBMFactor(EBMFactor, WeightedFactor):
                 raise RuntimeError("A node cannot be both categorical and spin.")
             is_spin[curr_type] = False
 
-        # don't want this to recognize nodes that haven't been seen here
-        # not sure how that would happen but better to be careful
         self.is_spin = dict(is_spin)
         self.spin_node_groups = spin_node_groups
         self.categorical_node_groups = categorical_node_groups
@@ -124,17 +111,13 @@ class DiscreteEBMFactor(EBMFactor, WeightedFactor):
         self.weights = weights
 
     def to_interaction_groups(self) -> list[InteractionGroup]:
-        """Produce interaction groups that implement this factor.
-
-        In this case, we have to treat the spin and categorical node groups slightly differently.
-        """
+        """Produce interaction groups that implement this factor."""
         interaction_groups = []
 
         n_spin = len(self.spin_node_groups)
         n_cat = len(self.categorical_node_groups)
         n_total = n_spin + n_cat
 
-        # handle the interaction groups with spin head nodes
         if n_spin > 0:
             spin_inds = list(range(len(self.spin_node_groups)))
             spin_combos = [(x, spin_inds[:i] + spin_inds[i + 1 :]) for i, x in enumerate(spin_inds)]
@@ -160,7 +143,6 @@ class DiscreteEBMFactor(EBMFactor, WeightedFactor):
                 )
             )
 
-        # handle the interaction groups with categorical head nodes
         if n_cat > 0:
             cat_inds = list(range(len(self.categorical_node_groups)))
             cat_combos = [(x, cat_inds[:i] + cat_inds[i + 1 :]) for i, x in enumerate(cat_inds)]
@@ -235,7 +217,6 @@ class SquareDiscreteEBMFactor(DiscreteEBMFactor):
                     raise RuntimeError("Interaction tensor is not square.")
 
     def to_interaction_groups(self) -> list[InteractionGroup]:
-        """Call the parent class to_interaction_groups, and merge the results."""
         groups = super().to_interaction_groups()
 
         spin_groups = []
@@ -289,9 +270,6 @@ def _batch_gather_with_k(x, *idx):
 
 def _split_states(states, n_spin):
     states_spin, states_cat = states[:n_spin], states[n_spin:]
-
-    # make sure spin values are actually bool, cat values are actually unsigned
-    # violating this could lead to some weird behaviour
 
     def _validate(check_states, name, ex_type):
         for state in check_states:

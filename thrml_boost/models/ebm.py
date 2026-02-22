@@ -73,14 +73,7 @@ class AbstractFactorizedEBM(AbstractEBM):
         self.node_shape_dtypes = node_shape_dtypes
 
     def energy(self, state: list[_State], blocks: "BlockSpec | list[Block]") -> Float[Array, ""]:
-        """Evaluate the total energy as the sum of all factor energies.
-
-        Accepts either a pre-built `BlockSpec` or a plain `list[Block]`. Internal
-        callers (e.g. `parallel_tempering._attempt_swap_pair`) should pass the
-        `BlockSpec` they already hold from the sampling program to avoid
-        rebuilding it on every call. User-facing callers can continue passing a
-        plain list of blocks for convenience.
-        """
+        """Evaluate the total energy as the sum of all factor energies."""
         if isinstance(blocks, BlockSpec):
             block_spec = blocks
         else:
@@ -96,8 +89,7 @@ class AbstractFactorizedEBM(AbstractEBM):
     @property
     @abc.abstractmethod
     def factors(self) -> list[EBMFactor]:
-        """A concrete implementation of this class must define this method that returns a list of factors that
-        substantiate the EBM."""
+        """The factors that define this EBM."""
         raise NotImplementedError
 
 

@@ -49,16 +49,6 @@ class IsingEBM(AbstractFactorizedEBM):
     beta: Array
 
     def __init__(self, nodes: list[AbstractNode], edges: list[Edge], biases: Array, weights: Array, beta: Array):
-        """Initialize an Ising EBM.
-
-        **Arguments:**
-
-        - `nodes`: List of nodes with associated biases
-        - `edges`: List of edge pairs with associated weights
-        - `biases`: Bias values for each node
-        - `weights`: Weight values for each edge
-        - `beta`: Temperature parameter
-        """
         sd_map = {nodes[0].__class__: jax.ShapeDtypeStruct((), jnp.bool_)}
         super().__init__(sd_map)
         self.nodes = nodes
@@ -81,14 +71,6 @@ class IsingSamplingProgram(FactorSamplingProgram):
     """A very thin wrapper on FactorSamplingProgram that specializes it to the case of an Ising Model."""
 
     def __init__(self, ebm: IsingEBM, free_blocks: list[SuperBlock], clamped_blocks: list[Block]):
-        """Initialize an Ising sampling program.
-
-        **Arguments:**
-
-        - `ebm`: The Ising EBM to sample from
-        - `free_blocks`: List of super blocks that are free to vary
-        - `clamped_blocks`: List of blocks that are held fixed
-        """
         samp = SpinGibbsConditional()
         spec = BlockGibbsSpec(free_blocks, clamped_blocks, ebm.node_shape_dtypes)
         super().__init__(spec, [samp for _ in spec.free_blocks], ebm.factors, [])
@@ -156,10 +138,7 @@ def hinton_init(
     """
     node_map = {node: i for i, node in enumerate(model.nodes)}
 
-    # Process each block independently so ragged block sizes are handled
-    # correctly. Blocks in a two-coloured checkerboard partition can have
-    # unequal lengths (e.g. 5 nodes → blocks of size 3 and 2), so we cannot
-    # stack them into a homogeneous (n_blocks, block_size) array.
+    # Process each block independently to handle ragged block sizes correctly.
     keys = jax.random.split(key, len(blocks))
 
     result = []
@@ -196,9 +175,6 @@ def estimate_moments(
     Returns:
         the first and second moment data
     """
-    # Build the moment spec. When first_moment_nodes is empty we skip the
-    # first-moment group entirely rather than passing a sentinel ((),) that
-    # would create a spurious empty moment inside MomentAccumulatorObserver.
     moment_spec = []
     if first_moment_nodes:
         moment_spec.append([(node,) for node in first_moment_nodes])
@@ -270,7 +246,6 @@ def estimate_kl_grad(
 
     cond_batched_pos = jax.tree.map(lambda x: jnp.broadcast_to(x, (data[0].shape[0], *x.shape)), conditioning_values)
 
-    # Name the chain/batch axes explicitly to make the split shape legible.
     n_chains_pos, batch_size = init_state_positive[0].shape[:2]
     keys_pos = jax.random.split(key_pos, (n_chains_pos, batch_size))
 

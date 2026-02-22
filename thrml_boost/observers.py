@@ -179,9 +179,6 @@ class MomentAccumulatorObserver(AbstractObserver):
             inside the scan body.
         """
         self.f_transform = f_transform
-        # Canonicalize the dtype immediately so that if JAX truncates float64
-        # to float32 (because JAX_ENABLE_X64 is not set), the warning fires
-        # once here at construction time rather than on every scan iteration.
         self._accumulate_dtype = jnp.zeros(0, dtype=dtype).dtype
 
         flat_nodes_list = []
@@ -254,8 +251,6 @@ class MomentAccumulatorObserver(AbstractObserver):
         )
 
         def accumulate_moment(mem_entry, sl):
-            # sl: (num_groups, nodes_in_moment) — gather then product over nodes_in_moment.
-            # mem_entry and update share _accumulate_dtype, so no cast needed.
             update = jnp.prod(flat_state[sl], axis=1)
             return mem_entry + update
 
@@ -263,9 +258,5 @@ class MomentAccumulatorObserver(AbstractObserver):
         return mem, None
 
     def init(self) -> list[Array]:
-        """Initialize the moment accumulators with the correct dtype.
-
-        Uses an explicit list comprehension rather than jax.tree.map over a list
-        of arrays, and initialises with `_accumulate_dtype` to avoid any per-step cast.
-        """
+        """Initialize the moment accumulators."""
         return [jnp.zeros(x.shape[0], dtype=self._accumulate_dtype) for x in self.flat_to_full_moment_slices]

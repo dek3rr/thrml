@@ -20,7 +20,6 @@ from jaxtyping import Array, Int, PyTree, Shaped
 from .pgm import AbstractNode
 
 _Node = TypeVar("_Node", bound=AbstractNode)
-# hashable description of general pytrees
 _PyTreeStruct: TypeAlias = tuple[
     PyTree,
     tuple[jax.ShapeDtypeStruct, ...],
@@ -169,7 +168,6 @@ class BlockSpec:
         - `node_shape_dtypes`: the mapping of node types to their structures. This
                 should be a pytree of `jax.ShapeDtypeStruct`s.
         """
-        # variable types are assigned to nodes based on their class
         self.node_shape_struct = dict(node_shape_dtypes)
         self.node_shape_dtypes = {i: _hash_pytree(j) for i, j in node_shape_dtypes.items()}
 
@@ -179,7 +177,6 @@ class BlockSpec:
         all_sds = list(dict.fromkeys(self.node_shape_dtypes.values()))
         self.global_sd_order = all_sds
 
-        # map from SD to location in global representation
         self.sd_index_map = {sd: i for i, sd in enumerate(self.global_sd_order)}
 
         for block in blocks:

@@ -271,17 +271,9 @@ def parallel_tempering(
             for b in range(n_free_blocks)
         ]
 
-    # Stack per_block_interactions across chains.
-    #
-    # Only JAX array leaves (the weights) are stacked; non-array leaves (e.g.
-    # DiscreteEBMInteraction.n_spin: int) are kept as Python ints from
-    # programs[0]. This is necessary because:
-    #   1. jnp.stack([1, 1], axis=0) produces jnp.array([1, 1]), and under
-    #      vmap that becomes a 0-d JAX array.
-    #   2. Code inside the sampler does `states[:interaction.n_spin]` which
-    #      requires a Python int, not a traced JAX value.
-    #
-    # See _stack_pbi_across_chains for the implementation.
+    # Stack per_block_interactions across chains. Only JAX array leaves (weights)
+    # are stacked; non-array leaves (e.g. Python ints used for slice indexing)
+    # are kept from programs[0] and broadcast via vmap in_axes=None.
     stacked_pbi = [
         [
             _stack_pbi_across_chains([programs[c].per_block_interactions[b][g] for c in range(n_chains)])
@@ -290,8 +282,6 @@ def parallel_tempering(
         for b in range(n_free_blocks)
     ]
 
-    # Matching in_axes pytree: 0 for array leaves (batch along chain axis),
-    # None for non-array leaves (same value for every chain, not batched).
     pbi_in_axes = _make_pbi_in_axes(stacked_pbi)
 
     n_pairs = max(n_chains - 1, 0)
@@ -301,9 +291,7 @@ def parallel_tempering(
     even_pair_indices = list(range(0, n_pairs, 2))
     odd_pair_indices = list(range(1, n_pairs, 2))
 
-    # -------------------------------------------------------------------------
-    # Build vmapped Gibbs runner
-    # -------------------------------------------------------------------------
+    # Build vmapped Gibbs runners.
     _run_all_chains_no_ss: object = None
     _run_all_chains_with_ss: object = None
 
@@ -348,9 +336,7 @@ def parallel_tempering(
             in_axes=(0, [0] * n_free_blocks, pbi_in_axes, ss_in_axes),
         )
 
-    # -------------------------------------------------------------------------
-    # Scan over rounds
-    # -------------------------------------------------------------------------
+    # Scan over rounds.
     def one_round(carry, round_idx):
         key, stacked_states, stacked_ss, accepted, attempted = carry
 
@@ -358,7 +344,6 @@ def parallel_tempering(
         gibbs_keys = jax.random.split(key_round, n_chains)
         key, swap_key = jax.random.split(key)
 
-        # --- Gibbs updates: all chains simultaneously via vmap ---
         # stacked_pbi is a constant captured in the closure; not part of carry.
         if all_ss_none:
             assert _run_all_chains_no_ss is not None
@@ -413,9 +398,6 @@ def parallel_tempering(
             one_round, init_carry, jnp.arange(n_rounds)
         )
 
-    # -------------------------------------------------------------------------
-    # Unstack back to list[list[Array]] format: states[chain][block]
-    # -------------------------------------------------------------------------
     states = [[stacked_states[b][c] for b in range(n_free_blocks)] for c in range(n_chains)]
 
     if all_ss_none:
