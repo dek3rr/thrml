@@ -92,6 +92,7 @@ nav:
     - Examples:
         - 'examples/01_all_of_thrml.ipynb'
         - 'examples/02_spin_models.ipynb'
+        - 'examples/03_parallel_tempering.ipynb'
     - API Reference:
         - 'api/pgm.md'
         - 'api/block_management.md'
@@ -100,6 +101,7 @@ nav:
         - 'api/conditional_samplers.md'
         - 'api/block_sampling.md'
         - 'api/observers.md'
+        - 'api/tempering.md'
         - Models:
             - 'api/models/ebm.md'
             - 'api/models/discrete_ebm.md'
